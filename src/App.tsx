@@ -4834,13 +4834,7 @@ const App = () => {
         const apps = getApps();
         let secondaryApp = apps.find(a => a.name === "Secondary");
         if (!secondaryApp) {
-          try {
-             const fbConf = require('../firebase-applet-config.json');
-             secondaryApp = initializeApp(fbConf, "Secondary");
-          } catch(e) {
-             const fbConf = await import('./firebase').then(m => m.db.app.options);
-             secondaryApp = initializeApp(fbConf, "Secondary");
-          }
+          secondaryApp = initializeApp(db.app.options, "Secondary");
         }
         const secondaryAuth = getAuth(secondaryApp);
         
