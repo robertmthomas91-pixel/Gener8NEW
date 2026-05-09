@@ -287,6 +287,50 @@ const App = () => {
     }
 
     const makeCall = async () => {
+      const isDevEnv =
+        window.location.hostname === "localhost" ||
+        window.location.hostname === "127.0.0.1" ||
+        window.location.hostname.includes("run.app");
+
+      // Try calling our backend proxy if this is deployed outside of AI Studio or if key is missing locally
+      if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
+        try {
+          const res = await fetch("/api/ai/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+               model, 
+               contents: typeof contents === 'string' 
+                   ? [{ role: 'user', parts: [{ text: contents }] }] 
+                   : Array.isArray(contents)
+                     ? contents
+                     : [{ role: 'user', parts: contents.parts || [contents] }], 
+               config, 
+               type 
+            })
+          });
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            throw new Error(errData.error || `HTTP error ${res.status}`);
+          }
+          const data = await res.json();
+
+          if (type === "video" || model.includes("veo") || type === "operation") {
+            return data;
+          }
+
+          return {
+            candidates: data.candidates?.map((c: any) => ({
+              content: { parts: c.content?.parts || [] }
+            })) || [],
+            text: data.text || data.candidates?.[0]?.content?.parts?.[0]?.text || "",
+          };
+        } catch (e: any) {
+          console.error("Backend AI proxy failed:", e);
+          throw new Error("Backend AI Generation failed: " + e.message);
+        }
+      }
+
       const apiKey = process.env.API_KEY || process.env.GEMINI_API_KEY;
 
       const { GoogleGenAI } = await import("@google/genai");
@@ -1128,11 +1172,16 @@ const App = () => {
             );
           }
 
-          const apiKey =
-            (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-          const videoRes = await fetch(downloadLink, {
-            headers: { "x-goog-api-key": apiKey },
-          });
+          let videoRes;
+          if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
+            videoRes = await fetch(`/api/ai/video-proxy?url=${encodeURIComponent(downloadLink)}`);
+          } else {
+            const apiKey =
+              (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
+            videoRes = await fetch(downloadLink, {
+              headers: { "x-goog-api-key": apiKey },
+            });
+          }
           const blob = await videoRes.blob();
           const url = URL.createObjectURL(blob);
 
@@ -1325,11 +1374,16 @@ const App = () => {
             );
           }
 
-          const apiKey =
-            (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-          const videoRes = await fetch(downloadLink, {
-            headers: { "x-goog-api-key": apiKey },
-          });
+          let videoRes;
+          if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
+            videoRes = await fetch(`/api/ai/video-proxy?url=${encodeURIComponent(downloadLink)}`);
+          } else {
+            const apiKey =
+              (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
+            videoRes = await fetch(downloadLink, {
+              headers: { "x-goog-api-key": apiKey },
+            });
+          }
           const blob = await videoRes.blob();
           const url = URL.createObjectURL(blob);
 
@@ -2580,11 +2634,16 @@ const App = () => {
         const downloadLink =
           operation.response?.generatedVideos?.[0]?.video?.uri;
         if (downloadLink) {
-          const apiKey =
-            (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-          const videoRes = await fetch(downloadLink, {
-            headers: { "x-goog-api-key": apiKey },
-          });
+          let videoRes;
+          if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
+            videoRes = await fetch(`/api/ai/video-proxy?url=${encodeURIComponent(downloadLink)}`);
+          } else {
+            const apiKey =
+              (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
+            videoRes = await fetch(downloadLink, {
+              headers: { "x-goog-api-key": apiKey },
+            });
+          }
           const blob = await videoRes.blob();
           const url = URL.createObjectURL(blob);
           results.push({ id: Date.now() + i, url });
@@ -2676,10 +2735,15 @@ const App = () => {
 
       const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
       if (downloadLink) {
-        const apiKey = (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
-        const videoRes = await fetch(downloadLink, {
-          headers: { "x-goog-api-key": apiKey },
-        });
+        let videoRes;
+        if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
+          videoRes = await fetch(`/api/ai/video-proxy?url=${encodeURIComponent(downloadLink)}`);
+        } else {
+          const apiKey = (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
+          videoRes = await fetch(downloadLink, {
+            headers: { "x-goog-api-key": apiKey },
+          });
+        }
         const blob = await videoRes.blob();
         const url = URL.createObjectURL(blob);
 
