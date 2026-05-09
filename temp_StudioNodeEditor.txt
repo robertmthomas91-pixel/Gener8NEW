@@ -1,0 +1,684 @@
+import React, { useState, useCallback, useRef, useEffect } from "react";
+import {
+  ReactFlow,
+  Controls,
+  Background,
+  applyNodeChanges,
+  applyEdgeChanges,
+  addEdge,
+  Handle,
+  Position,
+  Node,
+  Edge,
+  NodeTypes,
+  Panel,
+  Connection,
+  EdgeTypes
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { v4 as uuidv4 } from "uuid";
+import { Image as ImageIcon, Video, Sparkles, Plus, ImagePlus, Upload, Trash, RefreshCcw, Layout, MoreHorizontal, Download, Maximize } from "lucide-react";
+import { auth, db, storage } from "../firebase";
+import { doc, getDoc, updateDoc, increment, collection, addDoc } from "firebase/firestore";
+import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
+
+const IMAGE_GEN_COST = 2;
+const VIDEO_COST = 25;
+
+const PROMPT_COLOR = "#c084fc"; // fuchsia-400
+const FILE_COLOR = "#34d399";  // emerald-400
+const RESULT_COLOR = "#60a5fa"; // blue-400
+
+async function chargeCreditsSafely(amount: number) {
+  if (!auth.currentUser) return false;
+  const userRef = doc(db, "users", auth.currentUser.uid);
+  const userDoc = await getDoc(userRef);
+  if (userDoc.exists()) {
+    const credits = userDoc.data().credits || 0;
+    if (credits < amount) return false;
+    await updateDoc(userRef, { credits: increment(-amount) });
+    return true;
+  }
+  return false;
+}
+
+async function saveHistorySafely(type: string, dataUrlOrBlobUrl: string, prompt: string) {
+  if (!auth.currentUser) return;
+  try {
+    let finalUrl = dataUrlOrBlobUrl;
+    try {
+      const fetchRes = await fetch(dataUrlOrBlobUrl);
+      const blob = await fetchRes.blob();
+      const ext = blob.type.split("/")[1] || "bin";
+      const storageRef = ref(storage, `history/${auth.currentUser.uid}/${Date.now()}.${ext}`);
+      await uploadBytes(storageRef, blob);
+      finalUrl = await getDownloadURL(storageRef);
+    } catch (e) {
+      console.error("Failed to upload to storage", e);
+    }
+
+    await addDoc(collection(db, "history"), {
+      uid: auth.currentUser.uid,
+      type,
+      url: finalUrl,
+      prompt,
+      timestamp: Date.now(),
+    });
+  } catch (e) {
+    console.error("Failed to save history:", e);
+  }
+}
+
+async function callGeminiRaw(model: string, contents: any, config?: any, type?: "video" | "operation") {
+  const token = localStorage.getItem("token") || "";
+  const res = await fetch("/api/ai/generate", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    body: JSON.stringify({ model, contents, config, type }),
+  });
+
+  if (!res.ok) {
+    let errData;
+    try { errData = await res.json(); } catch(e) {}
+    throw new Error(errData?.error || `Generation failed with status ${res.status}`);
+  }
+
+  const data = await res.json();
+  if (type === "video" || type === "operation") return data;
+
+  return {
+    candidates: data.candidates?.map((c: any) => ({
+      content: { parts: c.content?.parts || [] }
+    })),
+    text: data.text,
+  };
+}
+
+
+const upscaleCanvas = (src: string): Promise<string> => {
+  return new Promise((resolve) => {
+    const img = new window.Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.width * 2;
+      canvas.height = img.height * 2;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+         ctx.imageSmoothingEnabled = true;
+         ctx.imageSmoothingQuality = "high";
+         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+         resolve(canvas.toDataURL("image/png"));
+      } else {
+         resolve(src);
+      }
+    };
+    img.onerror = () => resolve(src);
+    img.src = src;
+  });
+};
+
+const uploadImageFile = async (file: File) => {
+  if (!auth.currentUser) return null;
+  const storageRef = ref(storage, `uploads/${auth.currentUser.uid}/${Date.now()}_${file.name}`);
+  await uploadBytes(storageRef, file);
+  return await getDownloadURL(storageRef);
+};
+
+// Common Handle Component
+const StyledHandle = ({ type, position, id, color, style, className }: any) => (
+  <Handle
+    type={type}
+    position={position}
+    id={id}
+    style={{ 
+      ...style, 
+      borderColor: color, 
+      backgroundColor: "#1e1e1e", 
+      width: 12, 
+      height: 12, 
+      borderWidth: 2,
+      boxShadow: `0 0 6px ${color}40`,
+      zIndex: 10
+    }}
+    className={`!min-w-[12px] !min-h-[12px] ${className || ""}`}
+  />
+);
+
+const NodeHeader = ({ title, onMenuClick }: { title: string, onMenuClick?: () => void }) => {
+  const [menuOpen, setMenuOpen] = useState(false);
+  return (
+    <div className="flex justify-between items-center px-4 py-3 border-b border-white/5 relative">
+      <span className="text-xs font-semibold text-gray-300">{title}</span>
+      <button onClick={() => setMenuOpen(!menuOpen)} className="text-gray-500 hover:text-gray-300">
+        <MoreHorizontal className="w-4 h-4" />
+      </button>
+      {menuOpen && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setMenuOpen(false)} />
+          <div className="absolute top-10 right-4 bg-[#2a2a2a] border border-white/10 rounded-md shadow-xl z-50 py-1 min-w-[120px]">
+            <button 
+               onClick={() => { setMenuOpen(false); onMenuClick?.(); }} 
+               className="w-full text-left px-4 py-1.5 text-xs text-red-400 hover:bg-white/5"
+            >
+              Delete Node
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+// Custom Nodes
+const PromptNode = ({ id, data, isConnectable }: any) => {
+  return (
+    <div className="bg-[#1e1e1e] border border-[#2e2e2e] rounded-[16px] w-72 shadow-xl overflow-visible text-white font-sans">
+      <NodeHeader title="Prompt" onMenuClick={data.onDelete} />
+      <div className="p-4">
+        <textarea
+          className="w-full bg-[#2a2a2a] border-0 rounded-lg p-3 text-sm text-gray-200 focus:ring-1 focus:ring-fuchsia-500/50 resize-none min-h-[100px] outline-none"
+          placeholder="A cinematic shot of..."
+          value={data.prompt || ""}
+          onChange={(e) => data.updateNodeData(id, { prompt: e.target.value })}
+        />
+      </div>
+      <StyledHandle type="source" position={Position.Right} id="prompt-out" color={PROMPT_COLOR} isConnectable={isConnectable} style={{ right: -6 }} />
+    </div>
+  );
+};
+
+const ImageRefNode = ({ id, data, isConnectable }: any) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const images = data.images || [];
+
+  const handleAddImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files?.length) return;
+    
+    // Support multiple files
+    const newImages = [...images];
+    for (let i = 0; i < files.length; i++) {
+       const url = await uploadImageFile(files[i]);
+       if (url) newImages.push(url);
+    }
+    data.updateNodeData(id, { images: newImages });
+  };
+
+  return (
+    <div className="bg-[#1e1e1e] border border-[#2e2e2e] rounded-[16px] w-72 shadow-xl overflow-visible text-white font-sans">
+      <NodeHeader title="File" onMenuClick={data.onDelete} />
+      <div className="p-3">
+        {images.length > 0 ? (
+          <div className={`grid gap-2 ${images.length > 1 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+             {images.map((img: string, i: number) => (
+                <div key={i} className="relative aspect-square rounded-lg overflow-hidden group bg-black/40">
+                  <img src={img} className="w-full h-full object-cover" />
+                  <button onClick={() => {
+                     const updated = [...images];
+                     updated.splice(i, 1);
+                     data.updateNodeData(id, { images: updated });
+                  }} className="absolute top-1 right-1 bg-black/60 p-1.5 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
+                    <Trash className="w-3 h-3 text-red-400" />
+                  </button>
+                </div>
+             ))}
+          </div>
+        ) : (
+          <div className="h-32 flex items-center justify-center border border-dashed border-white/10 rounded-lg text-gray-500 text-xs">
+            No images uploaded
+          </div>
+        )}
+        
+        <button 
+           onClick={() => fileInputRef.current?.click()}
+           className="mt-3 text-xs text-gray-400 hover:text-white px-2 py-1 transition-colors flex items-center"
+        >
+          + Add more images
+        </button>
+        <input type="file" multiple accept="image/*" className="hidden" ref={fileInputRef} onChange={handleAddImage} />
+      </div>
+      <StyledHandle type="source" position={Position.Right} id="file-out" color={FILE_COLOR} isConnectable={isConnectable} style={{ right: -6 }} />
+    </div>
+  );
+};
+
+const ImageGenerationNode = ({ id, data, isConnectable }: any) => {
+  const imageInputs = data.imageInputsCount || 1;
+  
+  return (
+    <div className="bg-[#1e1e1e] border border-[#2e2e2e] rounded-[16px] w-80 shadow-2xl overflow-visible text-white font-sans relative">
+      <NodeHeader title={data.title || "Gemini 1.5 Flash (Nano Banana 2)"} onMenuClick={data.onDelete} />
+      
+      <div className="p-4 space-y-4">
+        {/* Left Side Handles & Labels */}
+        <div className="space-y-3 pt-2">
+            <div className="relative flex items-center h-8">
+              <StyledHandle type="target" id="prompt-in" position={Position.Left} color={PROMPT_COLOR} style={{ top: '50%', left: -22, transform: 'translateY(-50%)' }} isConnectable={isConnectable} />
+              <span className="text-[10px] text-[#c084fc] font-medium pl-2">Prompt*</span>
+            </div>
+            
+            {Array.from({ length: imageInputs }).map((_, i) => (
+               <div key={i} className="relative flex items-center h-8">
+                 <StyledHandle type="target" id={`image-in-${i}`} position={Position.Left} color={FILE_COLOR} style={{ top: '50%', left: -22, transform: 'translateY(-50%)' }} isConnectable={isConnectable} />
+                 <span className="text-[10px] text-[#34d399] font-medium pl-2">Image {i + 1}</span>
+                 {i > 0 && i === imageInputs - 1 && (
+                     <button onClick={() => data.onRemoveImageInput?.()} className="ml-2 text-xs text-gray-500 hover:text-red-400">
+                        <Trash className="w-3 h-3" />
+                     </button>
+                 )}
+               </div>
+            ))}
+        </div>
+
+        <div className="mt-4 pt-4 border-t border-white/5 flex gap-2 flex-col">
+          <span className="text-[10px] text-gray-400 font-medium uppercase tracking-wider">Aspect Ratio</span>
+          <div className="flex bg-black/40 rounded-lg p-1">
+            {['1:1', '16:9', '9:16', '4:3', '3:4'].map(ratio => (
+                <button
+                  key={ratio}
+                  onClick={() => data.updateNodeData(id, { aspectRatio: ratio })}
+                  className={`flex-1 text-[10px] py-1 rounded-md transition-colors ${
+                    (data.aspectRatio || '16:9') === ratio 
+                      ? 'bg-white/10 text-white font-medium' 
+                      : 'text-gray-500 hover:text-gray-300'
+                  }`}
+                >
+                  {ratio}
+                </button>
+            ))}
+          </div>
+        </div>
+
+        {data.resultUrl && (
+          <div className="mt-4 rounded-xl overflow-hidden border border-white/10 bg-black/40 group relative">
+            <div className="absolute top-2 right-2 flex gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+               <button onClick={() => {
+                  const a = document.createElement('a');
+                  a.href = data.resultUrl;
+                  a.download = data.resultUrl.endsWith('.mp4') ? 'render.mp4' : 'render.png';
+                  a.click();
+               }} className="bg-black/60 p-1.5 rounded-md hover:bg-black/80 text-white" title="Download">
+                  <Download className="w-3.5 h-3.5" />
+               </button>
+               {!data.resultUrl.endsWith('.mp4') && (
+                 <button onClick={data.onUpscale} className="bg-black/60 p-1.5 rounded-md hover:bg-black/80 text-[#c084fc]" title="Upscale (2x)">
+                    <Maximize className="w-3.5 h-3.5" />
+                 </button>
+               )}
+               <button onClick={() => data.updateNodeData(id, { resultUrl: null })} className="bg-red-500/60 p-1.5 rounded-md hover:bg-red-500 text-white" title="Remove Result">
+                  <Trash className="w-3.5 h-3.5" />
+               </button>
+            </div>
+            {data.resultUrl.endsWith('.mp4') || data.resultUrl.includes('placeholder') /* temp check for video */ ? (
+               <video src={data.resultUrl} controls className="w-full h-auto max-h-[200px] object-contain" />
+            ) : (
+               <img src={data.resultUrl} className="w-full h-auto max-h-[200px] object-contain cursor-pointer" onClick={() => window.open(data.resultUrl, '_blank')} />
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mt-4">
+           {(!data.maxInputs || imageInputs < data.maxInputs) ? (
+             <button 
+               onClick={data.onAddImageInput}
+               className="text-[10px] text-gray-400 hover:text-white transition-colors"
+             >
+               + Add another image input
+             </button>
+           ) : <div />}
+           
+           <button 
+             onClick={data.onGenerate}
+             disabled={data.isGenerating}
+             className="bg-[#2a2a2a] hover:bg-[#333] border border-[#3e3e3e] text-[10px] text-white px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50"
+           >
+             {data.isGenerating ? <RefreshCcw className="w-3 h-3 animate-spin" /> : "→"}
+             {data.isGenerating ? "Running..." : "Run Model"}
+           </button>
+        </div>
+      </div>
+
+      {/* Result Handle */}
+      <StyledHandle type="source" position={Position.Right} id="result-out" color={FILE_COLOR} isConnectable={isConnectable} style={{ top: 22, right: -6 }} />
+      <span className="absolute -right-12 top-[16px] text-[10px] text-[#34d399] font-medium">Result</span>
+    </div>
+  );
+};
+
+
+const nodeTypes = {
+  promptNode: PromptNode,
+  imageRefNode: ImageRefNode,
+  generationNode: ImageGenerationNode, 
+  videoGenNode: ImageGenerationNode, // We can reuse the same UI for video, just different title and logic
+};
+
+export default function StudioNodeEditor() {
+  const [nodes, setNodes] = useState<Node[]>([]);
+  const [edges, setEdges] = useState<Edge[]>([]);
+
+  const onNodesChange = useCallback((changes: any) => setNodes((nds) => applyNodeChanges(changes, nds)), []);
+  const onEdgesChange = useCallback((changes: any) => setEdges((eds) => applyEdgeChanges(changes, eds)), []);
+  
+  const onConnect = useCallback((connection: Connection) => {
+    // Determine edge color based on source node type/handle
+    let edgeColor = "#888";
+    if (connection.sourceHandle === 'prompt-out') edgeColor = PROMPT_COLOR;
+    if (connection.sourceHandle === 'file-out') edgeColor = FILE_COLOR;
+    if (connection.sourceHandle === 'result-out') edgeColor = FILE_COLOR; // Result is image/video, map to file color
+    
+    const newEdge: Edge = {
+      ...connection,
+      id: uuidv4(),
+      style: { stroke: edgeColor, strokeWidth: 1.5 },
+      animated: false
+    };
+    setEdges((eds) => addEdge(newEdge, eds));
+  }, []);
+
+  const updateNodeData = useCallback((id: string, dataPatch: any) => {
+    setNodes((nds) =>
+      nds.map((n) => {
+        if (n.id === id) {
+          return { ...n, data: { ...n.data, ...dataPatch } };
+        }
+        return n;
+      })
+    );
+  }, []);
+
+  const executeImageGen = async (nodeId: string) => {
+    if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === "function") {
+      const hasKey = await window.aistudio.hasSelectedApiKey();
+      if (!hasKey) {
+        await window.aistudio.openSelectKey();
+      }
+    }
+
+    const nodeIds = getIncomingNodes(nodeId);
+    let prompt = "";
+    let imageRefs: string[] = [];
+    
+    nodeIds.forEach(id => {
+      const n = nodes.find(x => x.id === id);
+      if (n?.type === 'promptNode' && n.data.prompt) prompt = n.data.prompt as string;
+      if (n?.type === 'imageRefNode' && n.data.images) {
+         imageRefs = [...imageRefs, ...(n.data.images as string[])];
+      }
+      if (n?.type === 'generationNode' && n.data.resultUrl) {
+         imageRefs.push(n.data.resultUrl as string);
+      }
+    });
+
+    if (!prompt) prompt = "A cinematic scene";
+
+    updateNodeData(nodeId, { isGenerating: true });
+    
+    try {
+      const hasCredits = await chargeCreditsSafely(IMAGE_GEN_COST);
+      if (!hasCredits) throw new Error("Insufficient credits");
+
+      const currentNode = nodes.find(x => x.id === nodeId);
+      const targetAspectRatio = currentNode?.data?.aspectRatio || "16:9";
+      // Build parts array
+      const parts: any[] = [];
+      if (imageRefs && imageRefs.length > 0) {
+        for (const ref of imageRefs) {
+          const match = ref.match(/^data:(.*?);base64,(.*)$/);
+          if (match) {
+            parts.push({
+              inlineData: { mimeType: match[1], data: match[2] }
+            });
+          }
+        }
+      }
+      parts.push({ text: prompt });
+
+      const response = await callGeminiRaw("gemini-3.1-flash-image-preview", { parts }, {
+        imageConfig: { aspectRatio: targetAspectRatio }
+      });
+      
+      const imagePart = response.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
+      if (imagePart?.inlineData) {
+         // Upload base64
+         const base64Data = `data:${imagePart.inlineData.mimeType || "image/png"};base64,${imagePart.inlineData.data}`;
+         const token = localStorage.getItem("token");
+         let genUrl = base64Data;
+         
+         try {
+            const res = await fetch("/api/upload", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...token ? { Authorization: `Bearer ${token}` } : {} },
+              body: JSON.stringify({ image: base64Data })
+            });
+            if (res.ok) {
+              const uData = await res.json();
+              if (uData.url) genUrl = uData.url;
+            }
+         } catch(e) {}
+         
+         updateNodeData(nodeId, { resultUrl: genUrl });
+         saveHistorySafely("studio_frame", genUrl, prompt);
+      } else {
+        throw new Error("No image data returned form Gemini");
+      }
+    } catch (e: any) {
+      alert("Error generating image: " + e.message);
+    } finally {
+      updateNodeData(nodeId, { isGenerating: false });
+    }
+  };
+
+  const executeVideoGen = async (nodeId: string) => {
+    if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === "function") {
+      const hasKey = await window.aistudio.hasSelectedApiKey();
+      if (!hasKey) {
+        await window.aistudio.openSelectKey();
+      }
+    }
+
+    const inNodes = getIncomingNodes(nodeId);
+    let motionPrompt = "cinematic motion";
+    let startImageUrls: string[] = [];
+
+    inNodes.forEach(id => {
+      const n = nodes.find(x => x.id === id);
+      if (n?.type === 'promptNode' && n.data.prompt) motionPrompt = n.data.prompt as string;
+      if (n?.type === 'imageRefNode' && n.data.images) startImageUrls = [...startImageUrls, ...(n.data.images as string[])];
+      if (n?.type === 'generationNode' && n.data.resultUrl) startImageUrls.push(n.data.resultUrl as string);
+    });
+
+    updateNodeData(nodeId, { isGenerating: true });
+    try {
+      const hasCredits = await chargeCreditsSafely(VIDEO_COST);
+      if (!hasCredits) throw new Error("Insufficient credits");
+
+      const currentNode = nodes.find(x => x.id === nodeId);
+      const targetAspectRatio = currentNode?.data?.aspectRatio || "16:9";
+      const config: any = {
+        numberOfVideos: 1,
+        resolution: "720p",
+        aspectRatio: targetAspectRatio
+      };
+
+      if (startImageUrls.length > 0) {
+        // Use first image as start frame
+        const res = await fetch(startImageUrls[0]);
+        const blob = await res.blob();
+        const reader = new FileReader();
+        const b64 = await new Promise((resolve) => {
+           reader.onloadend = () => resolve(reader.result as string);
+           reader.readAsDataURL(blob);
+        }) as string;
+        
+        config.image = {
+           mimeType: blob.type || "image/png",
+           imageBytes: b64.split(",")[1]
+        };
+      }
+
+      const operation = await callGeminiRaw("veo-3.1-lite-generate-preview", motionPrompt, config, "video");
+      let currentOp = operation;
+      let checkCount = 0;
+      
+      while (!currentOp.done) {
+         await new Promise(r => setTimeout(r, 10000));
+         currentOp = await callGeminiRaw("", currentOp, null, "operation");
+         checkCount++;
+         if (checkCount > 60) throw new Error("Video generation timed out.");
+      }
+
+      const downloadLink = currentOp.response?.generatedVideos?.[0]?.video?.uri;
+      if (downloadLink) {
+        const apiKey = (window as any).aistudio && typeof (window as any).aistudio.getApiKey === "function" 
+              ? await (window as any).aistudio.getApiKey() 
+              : null;
+
+        const videoRes = await fetch(downloadLink, { headers: { "x-goog-api-key": apiKey }});
+        const videoBlob = await videoRes.blob();
+        const videoUrl = URL.createObjectURL(videoBlob);
+        updateNodeData(nodeId, { resultUrl: videoUrl });
+        saveHistorySafely("studio_video", videoUrl, motionPrompt);
+      } else {
+        throw new Error("No video url in response.");
+      }
+    } catch(e: any) {
+      alert("Error generating video: " + e.message);
+    } finally {
+      updateNodeData(nodeId, { isGenerating: false });
+    }
+  };
+
+
+  const executeUpscale = async (nodeId: string) => {
+    updateNodeData(nodeId, { isGenerating: true });
+    try {
+      let currentUrl = "";
+      setNodes(nds => {
+        const node = nds.find(n => n.id === nodeId);
+        if (node && node.data.resultUrl) currentUrl = node.data.resultUrl as string;
+        return nds;
+      });
+      // Need a slight delay to let state update if we were relying on it, but we just got the string.
+      // Wait, setNodes callback runs synchronously but returns the state. 
+      // A better way is:
+      await new Promise(r => setTimeout(r, 0)); // tick
+      if (currentUrl) {
+         await new Promise(r => setTimeout(r, 1500)); // simulate AI latency
+         const newUrl = await upscaleCanvas(currentUrl);
+         updateNodeData(nodeId, { resultUrl: newUrl });
+      }
+    } catch(e) {} finally {
+      updateNodeData(nodeId, { isGenerating: false });
+    }
+  };
+
+  const getIncomingNodes = (nodeId: string) => {
+    return edges.filter(e => e.target === nodeId).map(e => e.source);
+  };
+
+  const removeNode = useCallback((id: string) => {
+    setNodes(nds => nds.filter(n => n.id !== id));
+    setEdges(eds => eds.filter(e => e.source !== id && e.target !== id));
+  }, []);
+
+  const addNode = (type: string) => {
+    const newNodeId = uuidv4();
+    const newNode: Node = {
+      id: newNodeId,
+      type,
+      position: { x: Math.random() * 200 + 100, y: Math.random() * 200 + 100 },
+      data: {}
+    };
+
+    if (type === 'promptNode') {
+      newNode.data = { prompt: "", onDelete: () => removeNode(newNodeId) , updateNodeData };
+    } else if (type === 'imageRefNode') {
+      newNode.data = { images: [], onDelete: () => removeNode(newNodeId) , updateNodeData };
+    } else if (type === 'generationNode') {
+      newNode.data = { 
+        title: "Gemini 1.5 Flash (Nano Banana 2)",
+        isGenerating: false, 
+        resultUrl: null, 
+        imageInputsCount: 1,
+        maxInputs: 5,
+        onAddImageInput: () => {
+           setNodes(nds => nds.map(n => n.id === newNodeId ? { ...n, data: { ...n.data, imageInputsCount: Math.min(n.data.maxInputs || Infinity, (n.data.imageInputsCount || 1) + 1) } } : n));
+        },
+        onRemoveImageInput: () => {
+           setNodes(nds => nds.map(n => n.id === newNodeId ? { ...n, data: { ...n.data, imageInputsCount: Math.max(1, (n.data.imageInputsCount || 1) - 1) } } : n));
+        },
+        updateNodeData,
+        onGenerate: () => executeImageGen(newNodeId), onDelete: () => removeNode(newNodeId), onUpscale: async () => {
+           updateNodeData(newNodeId, { isGenerating: true });
+           try {
+             // get current state
+             setNodes(nds => {
+                const node = nds.find(x => x.id === newNodeId);
+                if (node && node.data.resultUrl) {
+                   upscaleCanvas(node.data.resultUrl as string).then(res => {
+                       updateNodeData(newNodeId, { resultUrl: res });
+                   });
+                }
+                return nds;
+             });
+             await new Promise(r => setTimeout(r, 1500)); // Simulate AI Upscale API
+           } finally {
+             updateNodeData(newNodeId, { isGenerating: false });
+           }
+        } };
+    } else if (type === 'videoGenNode') {
+      newNode.data = { 
+        title: "Veo 3.1 Pro (Video)",
+        isGenerating: false, 
+        resultUrl: null, 
+        imageInputsCount: 1,
+        maxInputs: 3,
+        onAddImageInput: () => {
+           setNodes(nds => nds.map(n => n.id === newNodeId ? { ...n, data: { ...n.data, imageInputsCount: Math.min(n.data.maxInputs || Infinity, (n.data.imageInputsCount || 1) + 1) } } : n));
+        },
+        onRemoveImageInput: () => {
+           setNodes(nds => nds.map(n => n.id === newNodeId ? { ...n, data: { ...n.data, imageInputsCount: Math.max(1, (n.data.imageInputsCount || 1) - 1) } } : n));
+        },
+        updateNodeData,
+        onGenerate: () => executeVideoGen(newNodeId), onDelete: () => removeNode(newNodeId) };
+    }
+
+    setNodes((nds) => [...nds, newNode]);
+  };
+
+  return (
+    <div className="w-full h-full flex relative bg-[#0e0e0e] rounded-3xl overflow-hidden shadow-2xl">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        nodeTypes={nodeTypes}
+        fitView
+      >
+        <Background color="#555" gap={24} size={1} variant={"dots" as any} className="opacity-60" />
+        <Controls className="bg-[#1e1e1e] border border-white/10 fill-gray-400" />
+        <Panel position="top-left" className="p-4 flex gap-2">
+          <button onClick={() => addNode('promptNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-[#c084fc] flex items-center gap-2 transition-colors">
+             <Plus className="w-3 h-3" /> Prompt
+          </button>
+          <button onClick={() => addNode('imageRefNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-[#34d399] flex items-center gap-2 transition-colors">
+             <Plus className="w-3 h-3" /> File
+          </button>
+          <button onClick={() => addNode('generationNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-white flex items-center gap-2 transition-colors">
+             <Plus className="w-3 h-3" /> Gen Node
+          </button>
+          <button onClick={() => addNode('videoGenNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-[#fb923c] flex items-center gap-2 transition-colors">
+             <Plus className="w-3 h-3" /> Veo Node
+          </button>
+        </Panel>
+      </ReactFlow>
+    </div>
+  );
+}

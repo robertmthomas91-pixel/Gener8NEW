@@ -1,0 +1,73 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile containing credits and preferences",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] },
+        "credits": { "type": "number" },
+        "monthly_allowance": { "type": "number" },
+        "tier": { "type": "string" },
+        "last_reset_date": { "type": "string" }
+      },
+      "required": ["email", "credits", "monthly_allowance", "tier"]
+    },
+    "HistoryItem": {
+      "title": "History Item",
+      "description": "A generated video or image",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "type": { "type": "string", "enum": ["image", "video"] },
+        "url": { "type": "string" },
+        "prompt": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "folder_id": { "type": "string" }
+      },
+      "required": ["uid", "type", "url", "timestamp"]
+    },
+    "Folder": {
+      "title": "Folder",
+      "description": "A folder for organizing history items",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["uid", "name", "timestamp"]
+    },
+    "CreditRequest": {
+      "title": "Credit Request",
+      "description": "Request for more credits from a user",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "amount": { "type": "number" },
+        "timestamp": { "type": "number" }
+      },
+      "required": ["uid", "email", "amount", "timestamp"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles"
+    },
+    "history/{historyId}": {
+      "schema": { "$ref": "#/entities/HistoryItem" },
+      "description": "Generated images and videos"
+    },
+    "folders/{folderId}": {
+      "schema": { "$ref": "#/entities/Folder" },
+      "description": "Folders for organizing history items"
+    },
+    "credit_requests/{requestId}": {
+      "schema": { "$ref": "#/entities/CreditRequest" },
+      "description": "Requests for more credits from a user"
+    }
+  }
+}

@@ -1,0 +1,76 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() { return request.auth != null; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'credits', 'monthly_allowance', 'tier'])
+      && data.email is string && data.email.size() <= 256
+      && data.credits is number
+      && data.monthly_allowance is number
+      && data.tier is string && data.tier.size() <= 100
+      && data.last_reset_date is string && data.last_reset_date.size() <= 64;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false; // no blanket reads
+      allow create: if isSignedIn() && isValidId(userId) && request.auth.uid == userId && isValidUser(incoming());
+      allow update: if isSignedIn() && isValidId(userId) && request.auth.uid == userId
+        && isValidUser(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['credits', 'tier', 'monthly_allowance', 'last_reset_date']);
+    }
+
+    function isValidHistoryItem(data) {
+      return data.keys().hasAll(['uid', 'type', 'url', 'timestamp'])
+        && data.uid is string && data.uid.size() <= 128
+        && data.type is string && data.type.matches('^(image|video)$')
+        && data.url is string && data.url.size() <= 2048
+        && data.prompt is string && data.prompt.size() <= 10000
+        && data.timestamp is number
+        && (data.get('folder_id', '') is string && data.get('folder_id', '').size() <= 128);
+    }
+
+    match /history/{historyId} {
+      allow get: if isSignedIn() && isValidId(historyId) && existing().uid == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(historyId) 
+        && incoming().uid == request.auth.uid 
+        && isValidHistoryItem(incoming());
+      // The application allows assigning history to folders
+      allow update: if isSignedIn() && isValidId(historyId) && existing().uid == request.auth.uid
+        && incoming().uid == existing().uid
+        && isValidHistoryItem(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['folder_id']);
+      allow delete: if isSignedIn() && isValidId(historyId) && existing().uid == request.auth.uid;
+    }
+
+    function isValidFolder(data) {
+      return data.keys().hasAll(['uid', 'name', 'timestamp'])
+        && data.uid is string && data.uid.size() <= 128
+        && data.name is string && data.name.size() <= 256
+        && data.timestamp is number;
+    }
+
+    match /folders/{folderId} {
+      allow get: if isSignedIn() && isValidId(folderId) && existing().uid == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(folderId) 
+        && incoming().uid == request.auth.uid 
+        && isValidFolder(incoming());
+      allow update: if isSignedIn() && isValidId(folderId) && existing().uid == request.auth.uid
+        && incoming().uid == existing().uid
+        && isValidFolder(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name']);
+      allow delete: if isSignedIn() && isValidId(folderId) && existing().uid == request.auth.uid;
+    }
+  }
+}

@@ -1,0 +1,92 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} { allow read, write: if false; }
+
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() { 
+      return isSignedIn() && (request.auth.token.email == 'admin@gener8.ai' || 
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+      ); 
+    }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isValidId(id) { 
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'credits', 'monthly_allowance', 'tier', 'role', 'last_reset_date']) && data.keys().size() == 6 &&
+             data.email is string && data.email.size() <= 200 &&
+             data.role is string && data.role in ['admin', 'user'] &&
+             data.credits is number &&
+             data.monthly_allowance is number &&
+             data.tier is string && data.tier.size() <= 50 &&
+             data.last_reset_date is string && data.last_reset_date.size() <= 20;
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && isOwner(userId) && isValidUser(incoming()) && 
+                    (incoming().role == 'user' || (request.auth.token.email == 'admin@gener8.ai' && incoming().role == 'admin'));
+      allow update: if isValidId(userId) && (
+        isAdmin() ||
+        (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['credits']) && incoming().credits <= existing().credits)
+      );
+      allow delete: if isAdmin();
+    }
+
+    function isValidHistoryItem(data) {
+      return data.keys().hasAll(['uid', 'type', 'url', 'timestamp']) && data.keys().size() >= 4 && data.keys().size() <= 6 &&
+             data.uid is string && data.uid == request.auth.uid &&
+             data.type is string && data.type in ['image', 'video'] &&
+             data.url is string && data.url.size() <= 2000 &&
+             data.timestamp is number &&
+             (!('prompt' in data) || (data.prompt is string && data.prompt.size() <= 4000)) &&
+             (!('folder_id' in data) || (data.folder_id is string && data.folder_id.size() <= 128));
+    }
+
+    match /history/{historyId} {
+      allow get: if isOwner(existing().uid) || isAdmin();
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isValidId(historyId) && isValidHistoryItem(incoming());
+      allow update: if isOwner(existing().uid) && isOwner(incoming().uid) && isValidId(historyId) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['folder_id', 'prompt']);
+      allow delete: if isOwner(existing().uid) || isAdmin();
+    }
+
+    function isValidFolder(data) {
+      return data.keys().hasAll(['uid', 'name', 'timestamp']) && data.keys().size() == 3 &&
+             data.uid is string && data.uid == request.auth.uid &&
+             data.name is string && data.name.size() <= 150 &&
+             data.timestamp is number;
+    }
+
+    match /folders/{folderId} {
+      allow get: if isOwner(existing().uid) || isAdmin();
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isValidId(folderId) && isValidFolder(incoming());
+      allow update: if isOwner(existing().uid) && isOwner(incoming().uid) && isValidId(folderId) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name']);
+      allow delete: if isOwner(existing().uid) || isAdmin();
+    }
+    
+    function isValidCreditRequest(data) {
+      return data.keys().hasAll(['uid', 'email', 'amount', 'timestamp']) && data.keys().size() == 4 &&
+             data.uid is string && data.uid == request.auth.uid &&
+             data.email is string && data.email.size() <= 200 &&
+             data.amount is number &&
+             data.timestamp is number;
+    }
+
+    match /credit_requests/{requestId} {
+      allow create: if isValidId(requestId) && isValidCreditRequest(incoming());
+      allow get: if isOwner(existing().uid) || isAdmin();
+      allow list: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}
