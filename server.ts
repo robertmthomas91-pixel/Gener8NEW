@@ -558,17 +558,27 @@ async function startServer() {
       const ai = new GoogleGenAI({ apiKey });
       
       if (type === "video" || model.includes("veo")) {
-        const response = await (ai as any).models.generateVideos({
+        const reqFields: any = {
           model,
           prompt: contents,
-          config
-        });
+          config: { ...config }
+        };
+        
+        if (config && config.referenceImages && config.referenceImages.length > 0) {
+           reqFields.image = config.referenceImages[0].image;
+           delete reqFields.config.referenceImages;
+        } else if (config && config.image) {
+           reqFields.image = config.image;
+           delete reqFields.config.image;
+        }
+        
+        const response = await (ai as any).models.generateVideos(reqFields);
         return res.json(response);
       }
 
       if (type === "operation") {
-        const response = await (ai as any).operations.getVideosOperation({
-          operation: contents
+        const response = await (ai as any).operations.getVideosOperationInternal({
+          operationName: contents.name
         });
         return res.json(response);
       }

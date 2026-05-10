@@ -295,16 +295,19 @@ const App = () => {
       // Try calling our backend proxy if this is deployed outside of AI Studio or if key is missing locally
       if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
         try {
+          const isVideoOrOp = type === "video" || model.includes("veo") || type === "operation";
           const res = await fetch("/api/ai/generate", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ 
                model, 
-               contents: typeof contents === 'string' 
+               contents: isVideoOrOp 
+                 ? contents
+                 : (typeof contents === 'string' 
                    ? [{ role: 'user', parts: [{ text: contents }] }] 
                    : Array.isArray(contents)
                      ? contents
-                     : [{ role: 'user', parts: contents.parts || [contents] }], 
+                     : [{ role: 'user', parts: contents.parts || [contents] }]), 
                config, 
                type 
             })
@@ -338,16 +341,26 @@ const App = () => {
       const ai = new GoogleGenAI({ apiKey: apiKey || "dummy-key-for-interception" });
 
       if (type === "video" || model.includes("veo")) {
-        return await (ai as any).models.generateVideos({
+        const reqFields: any = {
           model,
           prompt: contents,
-          config,
-        });
+          config: { ...config }
+        };
+        
+        if (config && config.referenceImages && config.referenceImages.length > 0) {
+           reqFields.image = config.referenceImages[0].image;
+           delete reqFields.config.referenceImages;
+        } else if (config && config.image) {
+           reqFields.image = config.image;
+           delete reqFields.config.image;
+        }
+        
+        return await (ai as any).models.generateVideos(reqFields);
       }
 
       if (type === "operation") {
-        return await (ai as any).operations.getVideosOperation({
-          operation: contents,
+        return await (ai as any).operations.getVideosOperationInternal({
+          operationName: contents.name,
         });
       }
 
@@ -1156,11 +1169,11 @@ const App = () => {
           }
 
           const downloadLink =
-            currentOp.response?.generatedVideos?.[0]?.video?.uri;
+            (currentOp.response?.generatedVideos?.[0]?.video?.uri || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (currentOp as any).response?.generatedSamples?.[0]?.video?.uri) || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (currentOp as any).response?.generatedSamples?.[0]?.video?.uri || (currentOp as any).uri || currentOp.response?.uri;
           if (!downloadLink) {
             // Check for safety filters
             const safetyDetails =
-              currentOp.response?.generatedVideos?.[0]?.video?.videoMetadata
+              (currentOp.response?.generatedVideos?.[0]?.video?.videoMetadata || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.videoMetadata || (currentOp as any).response?.generatedSamples?.[0]?.video?.videoMetadata)
                 ?.safetyDetails;
             if (safetyDetails) {
               throw new Error(
@@ -1358,11 +1371,11 @@ const App = () => {
           }
 
           const downloadLink =
-            currentOp.response?.generatedVideos?.[0]?.video?.uri;
+            (currentOp.response?.generatedVideos?.[0]?.video?.uri || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (currentOp as any).response?.generatedSamples?.[0]?.video?.uri) || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (currentOp as any).response?.generatedSamples?.[0]?.video?.uri || (currentOp as any).uri || currentOp.response?.uri;
           if (!downloadLink) {
             // Check for safety filters
             const safetyDetails =
-              currentOp.response?.generatedVideos?.[0]?.video?.videoMetadata
+              (currentOp.response?.generatedVideos?.[0]?.video?.videoMetadata || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.videoMetadata || (currentOp as any).response?.generatedSamples?.[0]?.video?.videoMetadata)
                 ?.safetyDetails;
             if (safetyDetails) {
               throw new Error(
@@ -2434,15 +2447,36 @@ const App = () => {
       }
 
       setGenerationProgress(100);
-      const downloadLink = currentOp.response?.generatedVideos?.[0]?.video?.uri;
+      const downloadLink = 
+        (currentOp.response?.generatedVideos?.[0]?.video?.uri || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (currentOp as any).response?.generatedSamples?.[0]?.video?.uri) ||
+        currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
+        (currentOp as any).response?.generatedSamples?.[0]?.video?.uri ||
+        (currentOp as any).uri ||
+        currentOp.response?.uri;
       if (downloadLink) {
-        setStudioResult(downloadLink);
+        let finalUrl = downloadLink;
+        try {
+          let videoRes;
+          if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
+            videoRes = await fetch(`/api/ai/video-proxy?url=${encodeURIComponent(downloadLink)}`);
+          } else {
+            const apiKey = (window.aistudio && typeof (window as any).aistudio.getApiKey === "function" ? await (window as any).aistudio.getApiKey() : null) || process.env.API_KEY || process.env.GEMINI_API_KEY || "";
+            videoRes = await fetch(downloadLink, {
+              headers: { "x-goog-api-key": apiKey },
+            });
+          }
+          const blob = await videoRes.blob();
+          finalUrl = URL.createObjectURL(blob);
+        } catch (e) {
+          console.error("Failed to fetch video blob", e);
+        }
+        setStudioResult(finalUrl);
         setStudioResultType("video");
         await chargeCredits(VIDEO_COST);
-        await saveHistory("studio_video", downloadLink, fullPrompt);
+        await saveHistory("studio_video", finalUrl, fullPrompt);
       } else {
         const safetyDetails =
-          currentOp.response?.generatedVideos?.[0]?.video?.videoMetadata
+          (currentOp.response?.generatedVideos?.[0]?.video?.videoMetadata || currentOp.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.videoMetadata || (currentOp as any).response?.generatedSamples?.[0]?.video?.videoMetadata)
             ?.safetyDetails;
         if (
           safetyDetails &&
@@ -2621,7 +2655,7 @@ const App = () => {
             throw new Error("Lost connection to the video generation process.");
           }
           operation = nextOp;
-          console.log(`Poll ${pollCount}: done=${operation.done}`);
+          console.log(`Poll ${pollCount}: done=${operation.done}`, operation.response);
         }
 
         if (operation.error) {
@@ -2632,7 +2666,15 @@ const App = () => {
 
         setGenerationStatus(`Finalizing variation ${i + 1}...`);
         const downloadLink =
-          operation.response?.generatedVideos?.[0]?.video?.uri;
+          (operation.response?.generatedVideos?.[0]?.video?.uri || operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (operation as any).response?.generatedSamples?.[0]?.video?.uri) ||
+          operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
+          (operation as any).response?.generatedSamples?.[0]?.video?.uri ||
+          operation.response?.uri ||
+          (operation as any).uri;
+          
+        console.log("Operation response:", operation.response);
+        console.log("Download Link:", downloadLink);
+        
         if (downloadLink) {
           let videoRes;
           if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
@@ -2650,7 +2692,7 @@ const App = () => {
         } else {
           // Check for safety filters
           const safetyDetails =
-            operation.response?.generatedVideos?.[0]?.video?.videoMetadata
+            (operation.response?.generatedVideos?.[0]?.video?.videoMetadata || operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.videoMetadata || (operation as any).response?.generatedSamples?.[0]?.video?.videoMetadata)
               ?.safetyDetails;
           if (safetyDetails) {
             throw new Error(
@@ -2733,7 +2775,12 @@ const App = () => {
       clearInterval(progressInterval);
       setGenerationProgress(100);
 
-      const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
+      const downloadLink = 
+        (operation.response?.generatedVideos?.[0]?.video?.uri || operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (operation as any).response?.generatedSamples?.[0]?.video?.uri) ||
+        operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
+        (operation as any).response?.generatedSamples?.[0]?.video?.uri ||
+        (operation as any).uri ||
+        operation.response?.uri;
       if (downloadLink) {
         let videoRes;
         if (!window.aistudio && !process.env.GEMINI_API_KEY && !process.env.API_KEY) {
@@ -2959,12 +3006,7 @@ const App = () => {
 
         <div className="w-full max-w-md space-y-8 animate-in fade-in zoom-in-95 duration-500 relative z-10">
           <div className="text-center space-y-4">
-            <div className="l-gradient w-20 h-20 rounded-3xl flex items-center justify-center mx-auto shadow-2xl shadow-pink-500/20 mb-8">
-              <Film className="text-white w-10 h-10" />
-            </div>
-            <h1 className="text-4xl font-bold tracking-tighter text-white italic">
-              Gener<span style={{ color: "#E91E63" }}>8</span>
-            </h1>
+            <img src="/screen2.png" alt="Gener8 Logo" className="h-40 mx-auto mb-6 object-contain" />
             <p className="text-slate-400 text-sm uppercase tracking-[0.3em] font-medium">
               AI Studio Portal
             </p>
@@ -3098,14 +3140,9 @@ const App = () => {
         )}
 
       {/* Header */}
-      <header className="border-b border-white/10 bg-black/40 backdrop-blur-2xl sticky top-0 z-50 px-6 py-4 flex justify-between items-center">
+      <header className="border-b border-white/10 bg-black/40 backdrop-blur-2xl sticky top-0 z-50 px-6 py-2 flex justify-between items-center">
         <div className="flex items-center gap-3">
-          <div className="l-gradient p-1.5 rounded shadow-lg shadow-pink-500/10">
-            <Film className="text-white w-6 h-6" />
-          </div>
-          <h1 className="text-2xl font-bold tracking-tight text-white italic">
-            Gener<span style={{ color: "#E91E63" }}>8</span>
-          </h1>
+          <img src="/screen2.png" alt="Gener8 Logo" className="h-24 object-contain" />
         </div>
 
         <div className="flex items-center gap-8">
@@ -4714,7 +4751,7 @@ const App = () => {
                            </div>
                            <div className="space-y-3 max-h-96 overflow-y-auto pr-2 no-scrollbar">
                              {automatorClips.map((clip, idx) => (
-                               <div key={idx} className="flex gap-3 items-start bg-black/30 p-3 rounded-2xl border border-white/5">
+                               <div key={idx} className="flex gap-3 items-start bg-black/30 p-3 rounded-2xl border border-white/10">
                                  <textarea
                                    value={clip.prompt}
                                    onChange={(e) => setAutomatorClips(prev => prev.map((c, i) => i === idx ? { ...c, prompt: e.target.value } : c))}
@@ -4835,7 +4872,7 @@ const App = () => {
                       System Health Monitor
                     </h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                      <div className="bg-black/40 p-6 rounded-2xl border border-white/5">
+                      <div className="bg-black/40 p-6 rounded-2xl border border-white/10">
                         <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">
                           Active Users
                         </p>
@@ -4843,7 +4880,7 @@ const App = () => {
                           {siteHealth.activeUsers}
                         </p>
                       </div>
-                      <div className="bg-black/40 p-6 rounded-2xl border border-white/5">
+                      <div className="bg-black/40 p-6 rounded-2xl border border-white/10">
                         <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">
                           Generations (24h)
                         </p>
@@ -4851,7 +4888,7 @@ const App = () => {
                           {siteHealth.dailyGenerations}
                         </p>
                       </div>
-                      <div className="bg-black/40 p-6 rounded-2xl border border-white/5">
+                      <div className="bg-black/40 p-6 rounded-2xl border border-white/10">
                         <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">
                           System Status
                         </p>
@@ -4861,7 +4898,7 @@ const App = () => {
                           {siteHealth.systemStatus}
                         </p>
                       </div>
-                      <div className="bg-black/40 p-6 rounded-2xl border border-white/5">
+                      <div className="bg-black/40 p-6 rounded-2xl border border-white/10">
                         <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">
                           Bottlenecks
                         </p>
@@ -5044,7 +5081,7 @@ const App = () => {
                   <div className="w-full lg:w-64 shrink-0 flex flex-col gap-3 sticky top-8">
                     <button
                       onClick={() => setActiveFolder("all")}
-                      className={`flex items-center gap-3 p-4 rounded-2xl border transition-all text-left ${activeFolder === "all" ? "bg-white/10 border-white/20 text-white" : "bg-white/5 border-white/5 text-slate-400 hover:bg-white/10 hover:text-white"}`}
+                      className={`flex items-center gap-3 p-4 rounded-2xl border transition-all text-left ${activeFolder === "all" ? "bg-white/10 border-white/20 text-white" : "bg-white/5 border-white/10 text-slate-400 hover:bg-white/10 hover:text-white"}`}
                     >
                       <Film className="w-5 h-5 shrink-0" />
                       <span className="text-xs font-bold uppercase tracking-widest flex-1">
@@ -5070,7 +5107,7 @@ const App = () => {
                         const itemId = e.dataTransfer.getData("itemId");
                         if (itemId) handleDropIntoFolder(itemId, null);
                       }}
-                      className={`flex items-center gap-3 p-4 rounded-2xl border transition-all text-left ${activeFolder === null ? "bg-white/10 border-white/20 text-white" : "bg-white/5 border-white/5 text-slate-400 hover:bg-white/10 hover:text-white"}`}
+                      className={`flex items-center gap-3 p-4 rounded-2xl border transition-all text-left ${activeFolder === null ? "bg-white/10 border-white/20 text-white" : "bg-white/5 border-white/10 text-slate-400 hover:bg-white/10 hover:text-white"}`}
                     >
                       <FolderOpen className="w-5 h-5 shrink-0" />
                       <span className="text-xs font-bold uppercase tracking-widest flex-1">
@@ -5102,7 +5139,7 @@ const App = () => {
                             const itemId = e.dataTransfer.getData("itemId");
                             if (itemId) handleDropIntoFolder(itemId, f.id);
                           }}
-                          className={`group flex items-center justify-between p-4 rounded-2xl border transition-all text-left ${activeFolder === f.id ? "bg-white/10 border-white/20 text-white" : "bg-white/5 border-white/5 text-slate-400 hover:bg-white/10 hover:text-white"}`}
+                          className={`group flex items-center justify-between p-4 rounded-2xl border transition-all text-left ${activeFolder === f.id ? "bg-white/10 border-white/20 text-white" : "bg-white/5 border-white/10 text-slate-400 hover:bg-white/10 hover:text-white"}`}
                         >
                           <div className="flex items-center gap-3 flex-1 overflow-hidden">
                             <Folder className="w-5 h-5 shrink-0" />
@@ -5260,7 +5297,7 @@ const App = () => {
                 administrator.
               </p>
             </div>
-            <div className="bg-black/40 p-8 rounded-[2rem] border border-white/5 space-y-6">
+            <div className="bg-black/40 p-8 rounded-[2rem] border border-white/10 space-y-6">
               <div className="space-y-2">
                 <label className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.3em]">
                   Amount Requested
@@ -5281,7 +5318,7 @@ const App = () => {
             </div>
             <button
               onClick={() => setShowRequestModal(false)}
-              className="w-full py-5 text-xs font-bold text-slate-500 hover:text-white transition-all uppercase tracking-[0.4em] border border-white/5 rounded-2xl hover:bg-white/5"
+              className="w-full py-5 text-xs font-bold text-slate-500 hover:text-white transition-all uppercase tracking-[0.4em] border border-white/10 rounded-2xl hover:bg-white/5"
             >
               Cancel
             </button>
@@ -5305,7 +5342,7 @@ const App = () => {
                 ceiling.
               </p>
             </div>
-            <div className="bg-black/40 p-8 rounded-[2rem] border border-white/5 space-y-4">
+            <div className="bg-black/40 p-8 rounded-[2rem] border border-white/10 space-y-4">
               <p className="text-[10px] font-bold text-slate-500 uppercase tracking-[0.3em]">
                 Request More
               </p>
@@ -5324,7 +5361,7 @@ const App = () => {
             </div>
             <button
               onClick={() => setShowLimitModal(false)}
-              className="w-full py-5 text-xs font-bold text-slate-500 hover:text-white transition-all uppercase tracking-[0.4em] border border-white/5 rounded-2xl hover:bg-white/5"
+              className="w-full py-5 text-xs font-bold text-slate-500 hover:text-white transition-all uppercase tracking-[0.4em] border border-white/10 rounded-2xl hover:bg-white/5"
             >
               Close System Console
             </button>
@@ -5361,7 +5398,7 @@ const App = () => {
               {adminUsers.map((u) => (
                 <div
                   key={u.id}
-                  className="p-5 bg-black/40 rounded-3xl border border-white/5 group hover:border-pink-500/20 transition-all"
+                  className="p-5 bg-black/40 rounded-3xl border border-white/10 group hover:border-pink-500/20 transition-all"
                 >
                   <div className="flex justify-between items-start mb-3">
                     <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center border border-slate-700">
@@ -5424,7 +5461,7 @@ const App = () => {
                   setShowUsersModal(false);
                   navigate("/admin");
                 }}
-                className="w-full py-4 text-[10px] font-bold text-slate-500 hover:text-white transition-all uppercase tracking-[0.3em] border border-white/5 rounded-xl hover:bg-white/5 flex items-center justify-center gap-2"
+                className="w-full py-4 text-[10px] font-bold text-slate-500 hover:text-white transition-all uppercase tracking-[0.3em] border border-white/10 rounded-xl hover:bg-white/5 flex items-center justify-center gap-2"
               >
                 <Plus className="w-4 h-4" />
                 Provision New Account
