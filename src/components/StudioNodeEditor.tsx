@@ -31,7 +31,10 @@ import {
   Layers,
   User,
   Film,
-  Eraser
+  Eraser,
+  Save,
+  LayoutTemplate,
+  Play
 } from "lucide-react";
 import { auth, db, storage } from "../firebase";
 import { doc, getDoc, updateDoc, increment, collection, addDoc } from "firebase/firestore";
@@ -93,12 +96,12 @@ async function callGeminiRaw(model: string, contents: any, config?: any, type?: 
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
   const port = window.location.port !== "3000" && window.location.hostname === "localhost" ? "3000" : window.location.port;
   const host = window.location.hostname;
-  const url = port ? `${protocol}//${host}:${port}/api/gemini` : `/api/gemini`;
+  const url = port ? `${protocol}//${host}:${port}/api/ai/generate` : `/api/ai/generate`;
 
   const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
   if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(txt);
+    const errorJson = await res.json().catch(() => ({}));
+    throw new Error(errorJson.error || "Generation failed");
   }
   return await res.json();
 }
@@ -249,7 +252,13 @@ const convertToParts = (imageRefs: string[], promptText: string) => {
 
 const executeGenNode = async (nodeId: string, getNodes: () => Node[], getEdges: () => Edge[], updateNodeData: any) => {
   const data = getIncomingData(nodeId, getNodes, getEdges);
+  const currentNode = getNodes().find(x => x.id === nodeId);
   let finalPrompt = data.prompt || "A cinematic scene";
+  
+  if (currentNode?.data?.angle) {
+     finalPrompt += `. ${currentNode.data.angle}, clean background.`;
+  }
+  
   updateNodeData(nodeId, { isGenerating: true });
   
   try {
@@ -260,29 +269,69 @@ const executeGenNode = async (nodeId: string, getNodes: () => Node[], getEdges: 
     const targetAspectRatio = currentNode?.data?.aspectRatio || "16:9";
     const parts = convertToParts(data.allRefs, finalPrompt);
 
-    const response = await callGeminiRaw("gemini-3.1-flash-image-preview", { parts }, {
+    const response = await callGeminiRaw("gemini-2.5-flash-image", { parts }, {
       imageConfig: { aspectRatio: targetAspectRatio }
     });
     
     const imagePart = response.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
     if (imagePart?.inlineData) {
        const base64Data = `data:${imagePart.inlineData.mimeType || "image/png"};base64,${imagePart.inlineData.data}`;
-       updateNodeData(nodeId, { resultUrl: base64Data });
+       updateNodeData(nodeId, { resultUrl: base64Data, error: null });
        saveHistorySafely("image", base64Data, finalPrompt);
     } else {
       throw new Error("No image data returned from API");
     }
   } catch (e: any) {
-    alert("Error: " + e.message);
+    console.error(e);
+    updateNodeData(nodeId, { error: e.message || "Failed to generate" });
   } finally {
     updateNodeData(nodeId, { isGenerating: false });
   }
 };
 
+const combineImagesToGrid = (srcs: string[]): Promise<string> => {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const imgs = await Promise.all(
+        srcs.map((src) => {
+          return new Promise<HTMLImageElement>((res, rej) => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => res(img);
+            img.onerror = () => rej(new Error("Failed to load image for grid"));
+            img.src = src;
+          });
+        }),
+      );
+
+      if (imgs.length === 0) return reject(new Error("No images"));
+
+      const w = imgs[0].width;
+      const h = imgs[0].height;
+
+      const canvas = document.createElement("canvas");
+      canvas.width = w * 2;
+      canvas.height = h * 2;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return reject(new Error("No ctx"));
+
+      // 4 images assumed
+      ctx.drawImage(imgs[0], 0, 0, w, h);
+      if (imgs.length > 1) ctx.drawImage(imgs[1], w, 0, w, h);
+      if (imgs.length > 2) ctx.drawImage(imgs[2], 0, h, w, h);
+      if (imgs.length > 3) ctx.drawImage(imgs[3], w, h, w, h);
+
+      resolve(canvas.toDataURL("image/png"));
+    } catch (e) {
+      reject(e);
+    }
+  });
+};
+
 const executeMultiAngleGenNode = async (nodeId: string, getNodes: () => Node[], getEdges: () => Edge[], updateNodeData: any) => {
   const data = getIncomingData(nodeId, getNodes, getEdges);
   let basePrompt = data.prompt || "A high quality asset";
-  updateNodeData(nodeId, { isGenerating: true, resultUrls: null });
+  updateNodeData(nodeId, { isGenerating: true, resultUrls: null, resultUrl: null, error: null });
   
   try {
     const totalCost = IMAGE_GEN_COST * 4;
@@ -295,7 +344,7 @@ const executeMultiAngleGenNode = async (nodeId: string, getNodes: () => Node[], 
     const angles = ["Front View", "Side View", "Back View", "Top View"];
     const promises = angles.map(async (angle) => {
       const parts = convertToParts(data.allRefs, `${basePrompt}. ${angle}, clean background.`);
-      const response = await callGeminiRaw("gemini-3.1-flash-image-preview", { parts }, {
+      const response = await callGeminiRaw("gemini-2.5-flash-image", { parts }, {
         imageConfig: { aspectRatio: targetAspectRatio }
       });
       const imagePart = response.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
@@ -306,11 +355,15 @@ const executeMultiAngleGenNode = async (nodeId: string, getNodes: () => Node[], 
     });
 
     const results = (await Promise.all(promises)).filter(Boolean) as string[];
-    updateNodeData(nodeId, { resultUrls: results });
-    results.forEach(r => saveHistorySafely("image", r, basePrompt + " (Multi-Angle)"));
+    
+    if (results.length > 0) {
+      updateNodeData(nodeId, { resultUrls: results, resultUrl: results[0] });
+      results.forEach(r => saveHistorySafely("image", r, basePrompt + " (Multi-Angle)"));
+    }
 
   } catch (e: any) {
-    alert("Error: " + e.message);
+    console.error(e);
+    updateNodeData(nodeId, { error: e.message });
   } finally {
     updateNodeData(nodeId, { isGenerating: false });
   }
@@ -463,7 +516,7 @@ const ImageStandardNode = ({ id, data, isConnectable }: NodeProps) => {
 
   return (
     <div className="bg-[#1e1e1e] border border-[#2e2e2e] rounded-[16px] w-80 shadow-2xl overflow-visible text-white font-sans relative">
-      <NodeHeader title="Image Gen (Standard)" icon={ImageIcon} onMenuClick={() => setNodes(nds => nds.filter(n => n.id !== id))} />
+      <NodeHeader title={`Image Gen${data.angle ? ` (${data.angle})` : ' (Standard)'}`} icon={ImageIcon} onMenuClick={() => setNodes(nds => nds.filter(n => n.id !== id))} />
       <div className="p-4 space-y-4">
         <div className="space-y-3 pt-2">
             <div className="relative flex items-center h-8">
@@ -497,6 +550,11 @@ const ImageStandardNode = ({ id, data, isConnectable }: NodeProps) => {
         {data.resultUrl && (
           <div className="mt-4 rounded-xl overflow-hidden border border-white/10 bg-black/40 group relative">
             <img src={data.resultUrl as string} className="w-full h-auto max-h-[200px] object-contain" />
+          </div>
+        )}
+        {data.error && (
+          <div className="mt-4 text-[10px] text-red-400 bg-red-400/10 border border-red-500/20 rounded-xl p-2 px-3 break-words">
+            {data.error as string}
           </div>
         )}
         <div className="flex items-center justify-between mt-4">
@@ -534,13 +592,29 @@ const ImageMultiAngleNode = ({ id, data, isConnectable }: NodeProps) => {
             </div>
         </div>
         
-        {data.resultUrls && (data.resultUrls as string[]).length > 0 && (
-          <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl overflow-hidden border border-white/10 p-2 bg-black/40">
+        {(data.resultUrls && (data.resultUrls as string[]).length > 0) && (
+          <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl overflow-hidden border border-white/10 bg-black/40 p-2">
             {(data.resultUrls as string[]).map((url, idx) => (
-               <img key={idx} src={url} className="w-full h-auto object-cover rounded-md aspect-square" />
+              <div key={idx} className="relative group/dl">
+                <img src={url} className="w-full h-auto object-cover rounded-md aspect-square" alt={`Angle ${idx}`} />
+                <a
+                  href={url}
+                  download={`angle-${idx}.png`}
+                  className="absolute bottom-2 right-2 p-1.5 bg-black/60 hover:bg-black text-white rounded-md opacity-0 group-hover/dl:opacity-100 transition-opacity"
+                >
+                  <Download className="w-4 h-4" />
+                </a>
+              </div>
             ))}
           </div>
         )}
+        
+        {data.error && (
+          <div className="mt-4 text-[10px] text-red-400 bg-red-400/10 border border-red-500/20 rounded-xl p-2 px-3 break-words">
+            {data.error as string}
+          </div>
+        )}
+
         <div className="flex items-center justify-end mt-4">
            <button onClick={() => executeMultiAngleGenNode(id, getNodes, getEdges, updateNodeData)} disabled={!!data.isGenerating} className="bg-[#2a2a2a] hover:bg-[#333] border border-[#3e3e3e] text-[10px] text-white px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50">
              {data.isGenerating ? <RefreshCcw className="w-3 h-3 animate-spin" /> : "→"} {data.isGenerating ? "Running (4x Cost)..." : "Generate 4 Angles"}
@@ -682,6 +756,48 @@ const nodeTypes = {
 
 function FlowCanvas() {
   const { studioNodes: nodes, studioEdges: edges, setStudioNodes: setNodes, setStudioEdges: setEdges } = useAppStore();
+  const { fitView } = useReactFlow();
+
+  const [templates, setTemplates] = useState<any[]>(() => {
+    try {
+      const saved = localStorage.getItem("node_templates");
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [null, null, null, null, null];
+  });
+
+  const saveTemplate = useCallback((index: number) => {
+    const cleanNodes = nodes.map(n => ({
+      ...n,
+      data: {
+        ...n.data,
+        resultUrl: undefined,
+        resultUrls: undefined,
+        images: undefined,
+        isGenerating: undefined,
+        error: undefined
+      }
+    }));
+    const newTemplates = [...templates];
+    newTemplates[index] = { nodes: cleanNodes, edges };
+    setTemplates(newTemplates);
+    localStorage.setItem("node_templates", JSON.stringify(newTemplates));
+  }, [nodes, edges, templates]);
+
+  const loadTemplate = useCallback((index: number) => {
+    const t = templates[index];
+    if (t) {
+      setNodes(t.nodes || []);
+      setEdges(t.edges || []);
+    }
+  }, [templates, setNodes, setEdges]);
+
+  const clearTemplate = useCallback((index: number) => {
+    const newTemplates = [...templates];
+    newTemplates[index] = null;
+    setTemplates(newTemplates);
+    localStorage.setItem("node_templates", JSON.stringify(newTemplates));
+  }, [templates]);
 
   const onNodesChange = useCallback((changes: any) => setNodes((nds: any) => applyNodeChanges(changes, nds)), [setNodes]);
   const onEdgesChange = useCallback((changes: any) => setEdges((eds: any) => applyEdgeChanges(changes, eds)), [setEdges]);
@@ -697,6 +813,80 @@ function FlowCanvas() {
     };
     setNodes((nds: any[]) => [...nds, newNode]);
   }, [setNodes]);
+
+  const addMultiAngleMacro = useCallback(() => {
+    const xBase = Math.random() * 100 + 50;
+    const yBase = Math.random() * 100 + 50;
+    const basePromptId = uuidv4();
+    const fileRefId = uuidv4();
+    const angles = ["Front View", "Side View", "Back View", "Top View"];
+    
+    const newNodes: Node[] = [];
+    const newEdges: Edge[] = [];
+
+    newNodes.push({
+      id: basePromptId,
+      type: 'promptNode',
+      position: { x: xBase, y: yBase + 100 },
+      data: { prompt: "A high quality character" }
+    });
+
+    newNodes.push({
+      id: fileRefId,
+      type: 'imageRefNode',
+      position: { x: xBase, y: yBase + 350 }, // below prompt
+      data: {}
+    });
+
+    angles.forEach((angle, i) => {
+       const imgNodeId = uuidv4();
+       const col = i % 2;
+       const row = Math.floor(i / 2);
+       
+       newNodes.push({
+         id: imgNodeId,
+         type: 'imageStandardNode',
+         position: { x: xBase + 400 + col * 400, y: yBase + row * 450 },
+         data: { imageInputsCount: 1, aspectRatio: "16:9", angle }
+       });
+
+       newEdges.push({
+         id: uuidv4(),
+         source: basePromptId,
+         target: imgNodeId,
+         sourceHandle: 'prompt-out',
+         targetHandle: 'prompt-in'
+       });
+
+       newEdges.push({
+         id: uuidv4(),
+         source: fileRefId,
+         target: imgNodeId,
+         sourceHandle: 'file-out',
+         targetHandle: 'image-in-0'
+       });
+    });
+
+    setNodes((nds: any) => [...nds, ...newNodes]);
+    setEdges((eds: any) => [...eds, ...newEdges]);
+    
+    setTimeout(() => {
+      fitView({ duration: 800, padding: 0.1 });
+    }, 100);
+  }, [setNodes, setEdges, fitView]);
+
+  const { updateNodeData, getNodes, getEdges } = useReactFlow();
+
+  const runSelectedNodes = useCallback(() => {
+    const selected = nodes.filter(n => n.selected);
+    selected.forEach(n => {
+       if (n.type === 'imageStandardNode') executeGenNode(n.id, getNodes, getEdges, updateNodeData);
+       else if (n.type === 'imageMultiAngleNode') executeMultiAngleGenNode(n.id, getNodes, getEdges, updateNodeData);
+       else if (n.type === 'imageAvatarNode') executeAvatarGenNode(n.id, getNodes, getEdges, updateNodeData);
+       else if (n.type === 'videoIngredientsNode') executeVideoIngredientsNode(n.id, getNodes, getEdges, updateNodeData);
+       else if (n.type === 'videoFrameToFrameNode') executeVideoFrameNode(n.id, getNodes, getEdges, updateNodeData);
+    });
+  }, [nodes, getNodes, getEdges, updateNodeData]);
 
   const clearNodes = useCallback(() => {
     setNodes([]);
@@ -726,7 +916,7 @@ function FlowCanvas() {
           <button onClick={() => addNode('imageStandardNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-white flex items-center gap-2 transition-colors">
              <ImageIcon className="w-3 h-3" /> Image (Standard)
           </button>
-          <button onClick={() => addNode('imageMultiAngleNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-white flex items-center gap-2 transition-colors">
+          <button onClick={addMultiAngleMacro} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-white flex items-center gap-2 transition-colors">
              <Layers className="w-3 h-3" /> Multi Angle
           </button>
           <button onClick={() => addNode('imageAvatarNode')} className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#2e2e2e] px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-white flex items-center gap-2 transition-colors">
@@ -741,9 +931,47 @@ function FlowCanvas() {
           </button>
 
           <div className="flex-1" />
+          {nodes.filter(n => n.selected).length > 0 && (
+            <button onClick={runSelectedNodes} className="bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-emerald-400 flex items-center gap-2 transition-colors">
+               <Play className="w-3 h-3 fill-emerald-400" /> Run Selected ({nodes.filter(n => n.selected).length})
+            </button>
+          )}
           <button onClick={clearNodes} className="bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 px-4 py-2 rounded-lg text-xs font-bold tracking-wide text-red-400 flex items-center gap-2 transition-colors">
              <Eraser className="w-3 h-3" /> Clear Nodes
           </button>
+        </Panel>
+        <Panel position="bottom-center" className="p-4 flex gap-2 w-full max-w-3xl overflow-x-auto justify-center">
+           <div className="bg-[#1e1e1e]/90 border border-white/10 rounded-xl p-2 flex items-center gap-2 shadow-xl backdrop-blur-md">
+             <div className="flex items-center gap-1.5 px-3 py-1 mr-2 text-white/50 text-xs font-medium border-r border-white/10">
+               <LayoutTemplate className="w-4 h-4" /> Templates
+             </div>
+             {templates.map((t, idx) => (
+                <div key={idx} className="flex items-center gap-1 bg-[#0e0e0e] border border-[#2e2e2e] rounded-lg p-1 group">
+                   <button
+                     onClick={() => loadTemplate(idx)}
+                     disabled={!t}
+                     className={`w-8 h-8 flex items-center justify-center rounded-md font-bold text-xs transition-colors ${t ? 'bg-[#2a2a2a] hover:bg-[#333] text-white' : 'bg-transparent text-gray-600'}`}
+                   >
+                     {idx + 1}
+                   </button>
+                   <button
+                     onClick={() => saveTemplate(idx)}
+                     className="w-8 h-8 flex items-center justify-center rounded-md text-gray-400 hover:text-white hover:bg-[#2a2a2a] transition-colors"
+                     title="Save current layout to this slot"
+                   >
+                     <Save className="w-3.5 h-3.5" />
+                   </button>
+                   <button
+                     onClick={() => clearTemplate(idx)}
+                     disabled={!t}
+                     className={`w-8 h-8 flex items-center justify-center rounded-md transition-colors ${t ? 'text-red-400 hover:text-red-300 hover:bg-red-500/20' : 'text-gray-600'}`}
+                     title="Clear this slot"
+                   >
+                     <Eraser className="w-3.5 h-3.5" />
+                   </button>
+                </div>
+             ))}
+           </div>
         </Panel>
       </ReactFlow>
   );

@@ -41,7 +41,7 @@ service cloud.firestore {
     function isValidHistoryItem(data) {
       return data.keys().hasAll(['uid', 'type', 'url', 'timestamp']) && data.keys().size() >= 4 && data.keys().size() <= 6 &&
              data.uid is string && data.uid == request.auth.uid &&
-             data.type is string && data.type in ['image', 'video'] &&
+             data.type is string && data.type in ['image', 'video', 'studio_character', 'studio_frame', 'studio_video'] &&
              data.url is string && data.url.size() <= 2000 &&
              data.timestamp is number &&
              (!('prompt' in data) || (data.prompt is string && data.prompt.size() <= 4000)) &&

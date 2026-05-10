@@ -546,16 +546,13 @@ async function startServer() {
 
   app.post("/api/ai/generate", async (req, res) => {
     const { model, contents, config, type } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY || (process.env as any).API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
-    if (!apiKey) {
-      return res.status(500).json({ error: "Gemini API Key not configured on server" });
-    }
-
-    console.log("Using API key starting with: " + apiKey.substring(0, 5) + " length: " + apiKey.length);
+    console.log("Incoming generate payload:", { model, type, contents: typeof contents === 'string' ? contents.substring(0,20) : "object", config });
+    console.log("API Key present?", !!apiKey, "Length:", apiKey?.length);
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = new GoogleGenAI(apiKey ? { apiKey } : {});
       
       if (type === "video" || model.includes("veo")) {
         const reqFields: any = {
@@ -576,6 +573,51 @@ async function startServer() {
         return res.json(response);
       }
 
+      if (type === "image" || model.includes("imagen") || model.includes("flash-image")) {
+        let promptText = "";
+        
+        if (typeof contents === "string") {
+           promptText = contents;
+        } else if (Array.isArray(contents)) {
+           contents.forEach((c: any) => {
+             if (c.parts) {
+               c.parts.forEach((p: any) => {
+                 if (p.text) promptText += p.text + " ";
+               });
+             } else if (c.text) {
+               promptText += c.text + " ";
+             }
+           });
+        } else if (contents && contents.parts) {
+           contents.parts.forEach((p: any) => {
+             if (p.text) promptText += p.text + " ";
+           });
+        }
+        
+        // Use Imagen 4 for image generation
+        const response: any = await ai.models.generateImages({
+          model: 'imagen-4.0-generate-001',
+          prompt: promptText.trim() || 'A high quality image',
+          config: {
+            numberOfImages: 1,
+            aspectRatio: config?.imageConfig?.aspectRatio || '16:9'
+          }
+        });
+        
+        return res.json({
+          candidates: [{
+            content: {
+              parts: [{
+                inlineData: {
+                  mimeType: response.generatedImages?.[0]?.image?.mimeType || "image/png",
+                  data: response.generatedImages?.[0]?.image?.imageBytes
+                }
+              }]
+            }
+          }]
+        });
+      }
+
       if (type === "operation") {
         const response = await (ai as any).operations.getVideosOperationInternal({
           operationName: contents.name
@@ -592,19 +634,29 @@ async function startServer() {
       res.json(response);
     } catch (error: any) {
       console.error("Gemini Proxy Error:", error);
-      res.status(500).json({ error: error.message || "AI Generation failed" });
+      let errorMessage = error.message || "AI Generation failed";
+      
+      if (apiKey === "MY_GEMINI_API_KEY" || errorMessage.includes("API key not valid") || errorMessage.includes("API_KEY_INVALID")) {
+        errorMessage = "Invalid Gemini API Key. Please configure your GEMINI_API_KEY in the AI Studio Secrets panel (accessible via Settings -> Secrets).";
+      }
+
+      res.status(500).json({ error: errorMessage });
     }
   });
 
   app.get("/api/ai/video-proxy", async (req, res) => {
     const { url } = req.query;
-    const apiKey = process.env.GEMINI_API_KEY || (process.env as any).API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
     if (!url || typeof url !== 'string') {
       return res.status(400).json({ error: "Missing video URL" });
     }
 
     try {
+      if (apiKey === "MY_GEMINI_API_KEY") {
+        return res.status(500).json({ error: "Invalid Gemini API Key. Please configure your GEMINI_API_KEY in the AI Studio Secrets panel." });
+      }
+
       const response = await fetch(url, {
         headers: { 'x-goog-api-key': apiKey || '' }
       });

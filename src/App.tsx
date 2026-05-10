@@ -164,6 +164,9 @@ const App = () => {
     "workshop" | "story" | "multiAngle" | "characterGen"
   >("workshop");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+  const [videoGenerationProgress, setVideoGenerationProgress] = useState(0);
+  const [videoGenerationStatus, setVideoGenerationStatus] = useState("");
   const [showLimitModal, setShowLimitModal] = useState(false);
   const [showRequestModal, setShowRequestModal] = useState(false);
   const [showUsersModal, setShowUsersModal] = useState(false);
@@ -219,6 +222,9 @@ const App = () => {
   const [newUserEmail, setNewUserEmail] = useState("");
   const [newUserPassword, setNewUserPassword] = useState("");
   const [newUserAllowance, setNewUserAllowance] = useState(100);
+
+  const [editingCreditUserId, setEditingCreditUserId] = useState<string | null>(null);
+  const [editingCreditAmount, setEditingCreditAmount] = useState<string>("");
 
   const [isEnhancing, setIsEnhancing] = useState(false);
   const [generationStatus, setGenerationStatus] = useState<string>("");
@@ -1541,18 +1547,26 @@ const App = () => {
     userId: string,
     currentCredits: number,
   ) => {
-    const newAmount = prompt(
-      "Enter new credit balance:",
-      currentCredits.toString(),
-    );
-    if (newAmount === null || isNaN(Number(newAmount))) return;
+    setEditingCreditUserId(userId);
+    setEditingCreditAmount(currentCredits.toString());
+  };
+
+  const submitUpdateCredits = async () => {
+    if (!editingCreditUserId) return;
+    const newAmount = editingCreditAmount;
+    if (newAmount === null || isNaN(Number(newAmount))) {
+      setEditingCreditUserId(null);
+      return;
+    }
 
     try {
-      await updateDoc(doc(db, "users", userId), { credits: Number(newAmount) });
+      await updateDoc(doc(db, "users", editingCreditUserId), { credits: Number(newAmount) });
       fetchAdminData();
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'users/' + userId);
+      handleFirestoreError(err, OperationType.WRITE, 'users/' + editingCreditUserId);
       setErrorMessage("Failed to update credits.");
+    } finally {
+      setEditingCreditUserId(null);
     }
   };
 
@@ -1804,7 +1818,8 @@ const App = () => {
         };
       }
 
-      for (const angle of angles) {
+      setGenerationStatus("Synthesizing 4 different camera angles concurrently...");
+      const promises = angles.map(async (angle) => {
         const response = await withRetry(async () =>
           callGemini(
             "gemini-2.5-flash-image",
@@ -1829,15 +1844,14 @@ const App = () => {
           (p) => p.inlineData,
         );
         if (imagePart?.inlineData) {
-          const newUrl = await uploadImage(imagePart.inlineData.data);
-          newResults.push(newUrl);
+          return await uploadImage(imagePart.inlineData.data);
         }
+        return null;
+      });
 
-        if (angles.indexOf(angle) < angles.length - 1) {
-          setGenerationStatus(`Preparing next angle...`);
-          await new Promise((r) => setTimeout(r, 5000));
-        }
-      }
+      const resolvedUrls = await Promise.all(promises);
+      const newUrls = resolvedUrls.filter(Boolean) as string[];
+      newResults.push(...newUrls);
 
       clearInterval(progressInterval);
       setGenerationProgress(100);
@@ -2506,9 +2520,9 @@ const App = () => {
       return;
     }
 
-    setIsGenerating(true);
+    setIsGeneratingVideo(true);
     setErrorMessage(null);
-    setGenerationProgress(0);
+    setVideoGenerationProgress(0);
 
     let progressInterval: any = null;
     try {
@@ -2516,14 +2530,14 @@ const App = () => {
 
       // Progress simulation
       progressInterval = setInterval(() => {
-        setGenerationProgress((prev) => {
+        setVideoGenerationProgress((prev) => {
           if (prev >= 99) return prev;
           return prev + 0.5;
         });
       }, 1000);
 
       for (let i = 0; i < videoVariations; i++) {
-        setGenerationStatus(
+        setVideoGenerationStatus(
           `Initializing production for variation ${i + 1}/${videoVariations}...`,
         );
         let operation;
@@ -2535,7 +2549,7 @@ const App = () => {
           if (ingredients.setting) refImages.push(ingredients.setting);
 
           if (refImages.length > 0) {
-            setGenerationStatus(
+            setVideoGenerationStatus(
               `Uploading reference assets for variation ${i + 1}...`,
             );
             const referenceImagesPayload: any[] = await Promise.all(
@@ -2548,7 +2562,7 @@ const App = () => {
               })),
             );
 
-            setGenerationStatus(
+            setVideoGenerationStatus(
               `Starting high-fidelity generation for variation ${i + 1}...`,
             );
             operation = await withRetry(async () =>
@@ -2566,7 +2580,7 @@ const App = () => {
             );
           } else {
             // No ingredients, use fast text-to-video
-            setGenerationStatus(
+            setVideoGenerationStatus(
               `Starting fast production for variation ${i + 1}...`,
             );
             operation = await withRetry(async () =>
@@ -2583,7 +2597,7 @@ const App = () => {
             );
           }
         } else if (videoFlowAssetMode === "frames" && videoMode === "flow") {
-          setGenerationStatus(`Analyzing keyframes for variation ${i + 1}...`);
+          setVideoGenerationStatus(`Analyzing keyframes for variation ${i + 1}...`);
           operation = await withRetry(async () =>
             callGemini(
               "veo-3.1-lite-generate-preview",
@@ -2617,7 +2631,7 @@ const App = () => {
             ),
           );
         } else {
-          setGenerationStatus(`Starting production for variation ${i + 1}...`);
+          setVideoGenerationStatus(`Starting production for variation ${i + 1}...`);
           operation = await withRetry(async () =>
             callGemini(
               "veo-3.1-lite-generate-preview",
@@ -2643,7 +2657,7 @@ const App = () => {
             );
           }
 
-          setGenerationStatus(
+          setVideoGenerationStatus(
             `Processing variation ${i + 1}... (${pollCount * 30}s elapsed)`,
           );
           await new Promise((resolve) => setTimeout(resolve, 30000));
@@ -2664,7 +2678,7 @@ const App = () => {
           );
         }
 
-        setGenerationStatus(`Finalizing variation ${i + 1}...`);
+        setVideoGenerationStatus(`Finalizing variation ${i + 1}...`);
         const downloadLink =
           (operation.response?.generatedVideos?.[0]?.video?.uri || operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri || (operation as any).response?.generatedSamples?.[0]?.video?.uri) ||
           operation.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
@@ -2686,7 +2700,8 @@ const App = () => {
               headers: { "x-goog-api-key": apiKey },
             });
           }
-          const blob = await videoRes.blob();
+          const rawBlob = await videoRes.blob();
+          const blob = new Blob([rawBlob], { type: "video/mp4" });
           const url = URL.createObjectURL(blob);
           results.push({ id: Date.now() + i, url });
         } else {
@@ -2705,28 +2720,28 @@ const App = () => {
         }
 
         if (i < videoVariations - 1) {
-          setGenerationStatus(`Preparing next variation...`);
+          setVideoGenerationStatus(`Preparing next variation...`);
           await new Promise((r) => setTimeout(r, 10000));
         }
       }
 
       clearInterval(progressInterval);
-      setGenerationProgress(100);
+      setVideoGenerationProgress(100);
       setVideoResults((prev) => [...results.reverse(), ...prev]);
 
       // Update credits
       await chargeCredits(totalCost);
 
-      // Save to history
-      for (const res of results) {
-        await saveHistory("video", res.url, videoPrompt);
-      }
+      // Save to history without blocking
+      results.forEach(res => {
+        saveHistory("video", res.url, videoPrompt).catch(console.error);
+      });
     } catch (error: any) {
       setErrorMessage(error.message || "Failed to generate video.");
     } finally {
       if (progressInterval) clearInterval(progressInterval);
-      setIsGenerating(false);
-      setTimeout(() => setGenerationProgress(0), 1000);
+      setIsGeneratingVideo(false);
+      setTimeout(() => setVideoGenerationProgress(0), 1000);
     }
   };
 
@@ -2960,7 +2975,7 @@ const App = () => {
     };
 
     return (
-      <div className={`relative group/player ${className}`}>
+      <div className={`relative ${className}`}>
         <video
           ref={videoRef}
           src={src}
@@ -2969,29 +2984,8 @@ const App = () => {
           loop
           muted={isMuted}
           playsInline
+          controls
         />
-        <div className="absolute inset-0 bg-black/20 opacity-0 group-hover/player:opacity-100 transition-opacity flex items-center justify-center gap-4">
-          <button
-            onClick={togglePlay}
-            className="bg-white/20 backdrop-blur-md border border-white/10 text-white p-4 rounded-full hover:bg-white hover:text-black transition-all active:scale-90 shadow-2xl"
-          >
-            {isPlaying ? (
-              <Pause className="w-6 h-6" />
-            ) : (
-              <Play className="w-6 h-6 fill-current" />
-            )}
-          </button>
-          <button
-            onClick={toggleMute}
-            className="bg-white/20 backdrop-blur-md border border-white/10 text-white p-4 rounded-full hover:bg-white hover:text-black transition-all active:scale-90 shadow-2xl"
-          >
-            {isMuted ? (
-              <VolumeX className="w-6 h-6" />
-            ) : (
-              <Volume2 className="w-6 h-6" />
-            )}
-          </button>
-        </div>
       </div>
     );
   };
@@ -3129,12 +3123,12 @@ const App = () => {
         `}
       </style>
 
-      {(isGenerating || isUpscaling) &&
-        generationProgress > 0 /* Global Progress Bar */ && (
+      {(isGenerating || isGeneratingMultiAngle || isUpscaling || isGeneratingVideo) &&
+        (generationProgress > 0 || videoGenerationProgress > 0) /* Global Progress Bar */ && (
           <div className="fixed top-0 left-0 w-full h-1 bg-pink-500/20 z-[1000]">
             <div
-              className="h-full bg-pink-500 transition-all duration-300 ease-out"
-              style={{ width: `${generationProgress}%` }}
+              className={`h-full ${isUpscaling ? "bg-[#00E5FF]" : "bg-[#E91E63]"} transition-all duration-300 ease-out`}
+              style={{ width: `${Math.max(generationProgress, Math.max(videoGenerationProgress, 0))}%` }}
             ></div>
           </div>
         )}
@@ -3269,10 +3263,10 @@ const App = () => {
       </div>
 
       <main className="flex-1 max-w-7xl mx-auto p-4 md:p-8 w-full relative">
-        {(isGenerating || isUpscaling) && generationProgress < 100 && (
+        {(isGenerating || isGeneratingMultiAngle || isUpscaling || isGeneratingVideo) && (generationProgress < 100 || videoGenerationProgress < 100) && (
           <div
             className="fixed inset-x-0 top-0 z-[100] h-1 bg-pink-600 animate-pulse"
-            style={{ width: `${generationProgress}%` }}
+            style={{ width: `${Math.max(generationProgress, videoGenerationProgress)}%` }}
           ></div>
         )}
         {errorMessage && (
@@ -3920,46 +3914,48 @@ const App = () => {
 
                       <div className="lg:col-span-7">
                         {multiAngleResults.length > 0 ? (
-                          <div className="grid grid-cols-2 gap-4">
-                            {multiAngleResults.map((url, idx) => (
-                              <div
-                                key={idx}
-                                className="group relative aspect-video bg-slate-900 rounded-3xl overflow-hidden border border-slate-800 shadow-2xl"
-                              >
-                                <img
-                                  src={url}
-                                  alt={`Angle ${idx}`}
-                                  className="w-full h-full object-cover"
-                                />
-                                <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-3">
-                                  <button
-                                    onClick={() => setSelectedImage(url)}
-                                    className="p-3 bg-white/10 rounded-full hover:bg-white hover:text-black transition-all"
-                                  >
-                                    <Plus className="w-5 h-5" />
-                                  </button>
-                                  <button
-                                    onClick={() =>
-                                      handleDownload(url, `angle-${idx}`)
-                                    }
-                                    className="p-3 bg-white/10 rounded-full hover:bg-white hover:text-black transition-all"
-                                  >
-                                    <Download className="w-5 h-5" />
-                                  </button>
+                          <div className="relative aspect-video w-full bg-slate-900 rounded-[2.5rem] overflow-hidden border border-slate-800 shadow-2xl group flex flex-col p-2">
+                            <div className="grid grid-cols-2 grid-rows-2 gap-2 w-full h-full flex-1">
+                              {multiAngleResults.map((url, idx) => (
+                                <div
+                                  key={idx}
+                                  className="group/angle relative bg-black rounded-3xl overflow-hidden border border-slate-800"
+                                >
+                                  <img
+                                    src={url}
+                                    alt={`Angle ${idx}`}
+                                    className="w-full h-full object-cover transition-transform duration-700 group-hover/angle:scale-105"
+                                  />
+                                  <div className="absolute inset-0 bg-black/60 opacity-0 group-hover/angle:opacity-100 transition-opacity flex items-center justify-center gap-3">
+                                    <button
+                                      onClick={() => setSelectedImage(url)}
+                                      className="p-3 bg-white/10 rounded-full hover:bg-white hover:text-black transition-all"
+                                    >
+                                      <Plus className="w-5 h-5" />
+                                    </button>
+                                    <button
+                                      onClick={() =>
+                                        handleDownload(url, `angle-${idx}`)
+                                      }
+                                      className="p-3 bg-white/10 rounded-full hover:bg-white hover:text-black transition-all"
+                                    >
+                                      <Download className="w-5 h-5" />
+                                    </button>
+                                  </div>
+                                  <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/10">
+                                    <span className="text-[8px] font-black text-white uppercase tracking-widest">
+                                      {idx === 0
+                                        ? "Wide Shot"
+                                        : idx === 1
+                                          ? "Close-up"
+                                          : idx === 2
+                                            ? "Low Angle"
+                                            : "Bird's Eye"}
+                                    </span>
+                                  </div>
                                 </div>
-                                <div className="absolute bottom-4 left-4 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full border border-white/10">
-                                  <span className="text-[8px] font-black text-white uppercase tracking-widest">
-                                    {idx === 0
-                                      ? "Wide Shot"
-                                      : idx === 1
-                                        ? "Close-up"
-                                        : idx === 2
-                                          ? "Low Angle"
-                                          : "Bird's Eye"}
-                                  </span>
-                                </div>
-                              </div>
-                            ))}
+                              ))}
+                            </div>
                           </div>
                         ) : (
                           <div className="h-full min-h-[400px] border-2 border-dashed border-slate-800 rounded-[2.5rem] flex flex-col items-center justify-center text-slate-600 p-12 text-center">
@@ -4619,15 +4615,29 @@ const App = () => {
                               placeholder="Describe the action, camera movement, and evolution of the scene..."
                               className="w-full h-32 bg-black/50 border border-white/10 rounded-2xl p-4 text-sm text-slate-200 focus:outline-none focus:border-pink-500/50 resize-none transition-colors"
                             />
+                            <div className="flex justify-between items-center bg-black/30 p-4 rounded-xl border border-white/5">
+                              <label className="text-xs font-bold text-slate-300">Variations (Credits: {videoVariations * VIDEO_COST})</label>
+                              <div className="flex gap-2">
+                                {[1, 2, 3, 4].map((v) => (
+                                  <button
+                                    key={v}
+                                    onClick={() => setVideoVariations(v)}
+                                    className={`w-8 h-8 rounded shrink-0 flex items-center justify-center text-xs font-bold transition-all ${videoVariations === v ? "bg-pink-500 text-white" : "bg-white/10 text-slate-400 hover:bg-white/20"}`}
+                                  >
+                                    {v}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
                           </div>
                           
                           <button
                             onClick={handleGenerateVideo}
-                            disabled={isGenerating || !videoPrompt}
+                            disabled={isGeneratingVideo || !videoPrompt}
                             className="w-full group relative overflow-hidden rounded-2xl bg-white text-black p-4 font-bold text-sm tracking-wide transition-all disabled:opacity-50 disabled:cursor-not-allowed hover:scale-[1.02] active:scale-[0.98]"
                           >
                             <span className="relative z-10 flex items-center justify-center gap-2">
-                              {isGenerating ? (
+                              {isGeneratingVideo ? (
                                 <>
                                   <Loader2 className="w-5 h-5 animate-spin" />
                                   Rendering Scene...
@@ -4644,8 +4654,27 @@ const App = () => {
                       </div>
 
                       <div className="lg:col-span-7">
+                        {(isGeneratingVideo) &&
+                          videoGenerationProgress > 0 && (
+                            <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-lg animate-in fade-in duration-300">
+                              <div className="w-full max-w-md bg-white/5 backdrop-blur-3xl border border-white/10 p-8 rounded-3xl shadow-2xl space-y-4 text-center">
+                                <p className="text-sm font-bold uppercase tracking-widest text-pink-500 animate-pulse">
+                                  Generating Video...
+                                </p>
+                                <div className="w-full bg-slate-800 rounded-full h-2.5">
+                                  <div
+                                    className="bg-pink-500 h-2.5 rounded-full transition-all duration-300 ease-out"
+                                    style={{ width: `${videoGenerationProgress}%` }}
+                                  />
+                                </div>
+                                <p className="text-xs text-slate-400 font-mono">
+                                  {videoGenerationStatus || `Rendering Scene (${Math.round(videoGenerationProgress)}%)`}
+                                </p>
+                              </div>
+                            </div>
+                          )}
                         <div className="bg-[#0A0A0B] border border-white/10 rounded-[2.5rem] p-4 lg:p-8 min-h-[600px] flex flex-col shadow-2xl relative overflow-hidden">
-                           {!isGenerating && videoResults.length === 0 ? (
+                           {!isGeneratingVideo && videoResults.length === 0 ? (
                              <div className="flex-1 flex flex-col items-center justify-center text-center max-w-sm mx-auto space-y-6">
                                 <Video className="w-16 h-16 text-slate-800" />
                                 <div>
@@ -4658,17 +4687,14 @@ const App = () => {
                                {videoResults.map((v, i) => (
                                  <div key={i} className="aspect-video bg-black rounded-xl overflow-hidden shadow-lg group relative">
                                     <video src={v.url} controls autoPlay loop className="w-full h-full object-cover" />
-                                    <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-4">
+                                    <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-end gap-2 pointer-events-none">
                                        <button onClick={() => {
                                           const a = document.createElement("a");
                                           a.href = v.url;
                                           a.download = `video-${Date.now()}.mp4`;
                                           a.click();
-                                       }} className="p-3 bg-white/20 hover:bg-white text-white hover:text-black rounded-full backdrop-blur-md transition-colors">
-                                          <Download className="w-5 h-5" />
-                                       </button>
-                                       <button onClick={() => setSelectedImage(v.url)} className="p-3 bg-white/20 hover:bg-white text-white hover:text-black rounded-full backdrop-blur-md transition-colors">
-                                          <Maximize2 className="w-5 h-5" />
+                                       }} className="p-2 bg-black/50 hover:bg-white text-white hover:text-black rounded-xl backdrop-blur-md transition-colors pointer-events-auto shadow-lg">
+                                          <Download className="w-4 h-4" />
                                        </button>
                                     </div>
                                  </div>
@@ -5540,6 +5566,35 @@ const App = () => {
           AI Studio Standard • 16:9 • High-Fidelity
         </div>
       </footer>
+
+      {editingCreditUserId && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm px-4">
+          <div className="bg-[#111] p-6 rounded-[2rem] border border-white/10 w-full max-w-sm">
+            <h3 className="text-white font-bold mb-4">Update Credits</h3>
+            <input
+              type="number"
+              value={editingCreditAmount}
+              onChange={(e) => setEditingCreditAmount(e.target.value)}
+              className="w-full bg-black border border-white/10 rounded-xl px-4 py-3 text-white mb-4 focus:border-pink-500 outline-none"
+              placeholder="Enter new credits"
+            />
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setEditingCreditUserId(null)}
+                className="px-4 py-2 text-white hover:bg-white/10 rounded-xl transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={submitUpdateCredits}
+                className="px-4 py-2 bg-pink-600 hover:bg-pink-500 text-white font-bold rounded-xl shadow-lg transition-colors"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
